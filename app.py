@@ -36,7 +36,7 @@ def init_db():
         db = get_db()
         cursor = db.cursor()
         
-        # Create books table
+        # Create books table (simplified - no sync tracking)
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS books (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -54,14 +54,13 @@ def init_db():
                 ratings_count INTEGER,
                 stock_quantity INTEGER DEFAULT 10,
                 price REAL DEFAULT 0.0,
-                last_updated TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                synced_at TIMESTAMP DEFAULT NULL
+                last_updated TIMESTAMP DEFAULT NULL
             )
         ''')
         
         # Create index on ISBN13 for faster lookups
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_isbn13 ON books(isbn13)')
-        cursor.execute('CREATE INDEX IF NOT EXISTS idx_synced ON books(synced_at)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_last_updated ON books(last_updated)')
         
         db.commit()
         logger.info("Database initialized successfully")
@@ -86,12 +85,13 @@ def load_csv_data():
                 rating = float(row.get('average_rating', 3.0)) if pd.notna(row.get('average_rating')) else 3.0
                 price = round(rating * 5 + 5, 2)  # Price between $10-25 based on rating
                 
+                # DON'T set last_updated when loading from CSV - only when actually modifying
                 cursor.execute('''
                     INSERT OR REPLACE INTO books 
                     (isbn13, isbn10, title, subtitle, authors, categories, 
                      thumbnail, description, published_year, average_rating, 
-                     num_pages, ratings_count, stock_quantity, price, last_updated)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                     num_pages, ratings_count, stock_quantity, price)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ''', (
                     str(row.get('isbn13', '')).strip(),
                     str(row.get('isbn10', '')).strip(),
@@ -130,31 +130,38 @@ def hello_world():
         "message": "Bookstore Flask API is running!",
         "code": 200,
         "endpoints": [
-            "/books/changed - GET books that have changed since last sync",
-            "/books/load-csv - POST load books from CSV",
-            "/books/mark-synced - POST mark books as synced"
+            "/books/changed - GET recently changed books (last 24 hours)",
+            "/books/load-csv - POST load books from CSV - only on initial load"
         ]
     }
 
 @app.route("/books/changed", methods=["GET"])
 def get_changed_books():
-    """Get books that have changed since last sync - for Next.js server to poll"""
+    """Get books that have been actually modified (not just loaded from CSV)"""
     try:
         db = get_db()
         cursor = db.cursor()
         
-        # Get books that have been updated since they were last synced
-        # (or never synced at all)
+        # Get hours parameter (default 24 hours)
+        hours = int(request.args.get('hours', 24))
+        
+        # Get books that have been MODIFIED (have a last_updated timestamp)
+        # CSV loading doesn't set last_updated, only actual modifications do
         cursor.execute('''
             SELECT id, isbn13, isbn10, title, subtitle, authors, categories, 
                    thumbnail, description, published_year, average_rating, 
                    num_pages, ratings_count, stock_quantity, price, last_updated
             FROM books 
-            WHERE synced_at IS NULL OR last_updated > synced_at
+            WHERE last_updated IS NOT NULL 
+            AND last_updated > datetime('now', '-{} hours')
             ORDER BY last_updated DESC
-        ''')
+        '''.format(hours))
         
-        changed_books = [dict(row) for row in cursor.fetchall()]
+        changed_books = []
+        for row in cursor.fetchall():
+            book_dict = dict(row)
+            book_dict['changedAt'] = book_dict['last_updated']  # Add changedAt field
+            changed_books.append(book_dict)
         
         # Get total count for info
         cursor.execute('SELECT COUNT(*) FROM books')
@@ -164,8 +171,9 @@ def get_changed_books():
             "changed_books": changed_books,
             "count": len(changed_books),
             "total_books_in_db": total_books,
+            "hours_checked": hours,
             "timestamp": datetime.now().isoformat(),
-            "message": f"Found {len(changed_books)} books that need syncing"
+            "message": f"Found {len(changed_books)} books actually modified in last {hours} hours"
         })
         
     except Exception as e:
@@ -184,40 +192,6 @@ def load_books_from_csv():
     except Exception as e:
         logger.error(f"Error loading books from CSV: {e}")
         return jsonify({"error": "Failed to load books from CSV"}), 500
-
-@app.route("/books/mark-synced", methods=["POST"])
-def mark_books_synced():
-    """Mark books as synced after Next.js server has processed them"""
-    try:
-        data = request.get_json()
-        book_ids = data.get('book_ids', [])
-        
-        if not book_ids:
-            return jsonify({"error": "book_ids array is required"}), 400
-        
-        db = get_db()
-        cursor = db.cursor()
-        
-        # Mark books as synced
-        placeholders = ','.join(['?' for _ in book_ids])
-        cursor.execute(f'''
-            UPDATE books 
-            SET synced_at = CURRENT_TIMESTAMP 
-            WHERE id IN ({placeholders})
-        ''', book_ids)
-        
-        updated_count = cursor.rowcount
-        db.commit()
-        
-        logger.info(f"Marked {updated_count} books as synced")
-        return jsonify({
-            "message": f"Successfully marked {updated_count} books as synced",
-            "updated_count": updated_count
-        })
-        
-    except Exception as e:
-        logger.error(f"Error marking books as synced: {e}")
-        return jsonify({"error": "Failed to mark books as synced"}), 500
 
 # App teardown
 @app.teardown_appcontext
