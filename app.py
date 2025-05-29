@@ -131,7 +131,10 @@ def hello_world():
         "code": 200,
         "endpoints": [
             "/books/changed - GET recently changed books (last 24 hours)",
-            "/books/load-csv - POST load books from CSV - only on initial load"
+            "/books/load-csv - POST load books from CSV - only on initial load",
+            "/books/debug - GET debug timestamp and book modification info",
+            "/books/debug-csv - GET debug CSV file access and loading issues",
+            "/books/test-modify - POST modify 3 random books for testing"
         ]
     }
 
@@ -192,6 +195,181 @@ def load_books_from_csv():
     except Exception as e:
         logger.error(f"Error loading books from CSV: {e}")
         return jsonify({"error": "Failed to load books from CSV"}), 500
+
+@app.route("/books/debug", methods=["GET"])
+def debug_timestamps():
+    """Debug endpoint to check timestamp issues"""
+    try:
+        db = get_db()
+        cursor = db.cursor()
+        
+        # Get current time from Python
+        python_time = datetime.now().isoformat()
+        
+        # Get current time from SQLite
+        cursor.execute("SELECT datetime('now')")
+        sqlite_time = cursor.fetchone()[0]
+        
+        # Get all books with last_updated (regardless of time)
+        cursor.execute("""
+            SELECT id, title, last_updated, 
+                   (julianday('now') - julianday(last_updated)) * 24 as hours_ago
+            FROM books 
+            WHERE last_updated IS NOT NULL 
+            ORDER BY last_updated DESC 
+            LIMIT 10
+        """)
+        
+        recent_books = []
+        for row in cursor.fetchall():
+            recent_books.append({
+                "id": row[0],
+                "title": row[1],
+                "last_updated": row[2],
+                "hours_ago": round(row[3], 2)
+            })
+        
+        # Count total modified books
+        cursor.execute("SELECT COUNT(*) FROM books WHERE last_updated IS NOT NULL")
+        total_modified = cursor.fetchone()[0]
+        
+        # Test the exact query used in /books/changed
+        hours = int(request.args.get('hours', 24))
+        cursor.execute(f"""
+            SELECT COUNT(*) FROM books 
+            WHERE last_updated IS NOT NULL 
+            AND last_updated > datetime('now', '-{hours} hours')
+        """)
+        matching_count = cursor.fetchone()[0]
+        
+        return jsonify({
+            "python_current_time": python_time,
+            "sqlite_current_time": sqlite_time,
+            "total_modified": total_modified,
+            "recent_modified_books": recent_books,
+            "query_hours": hours,
+            "books_matching_query": matching_count,
+            "query_used": f"last_updated > datetime('now', '-{hours} hours')"
+        })
+        
+    except Exception as e:
+        logger.error(f"Error in debug endpoint: {e}")
+        return jsonify({"error": str(e)}), 500
+
+@app.route("/books/debug-csv", methods=["GET"])
+def debug_csv():
+    """Debug CSV file access and loading issues"""
+    try:
+        import os
+        import pandas as pd
+        
+        # Get current working directory
+        cwd = os.getcwd()
+        
+        # Check if data directory exists
+        data_dir_exists = os.path.exists('data')
+        data_dir_contents = []
+        if data_dir_exists:
+            data_dir_contents = os.listdir('data')
+        
+        # Check if CSV file exists
+        csv_path = 'bookstoreflaskapi/data/data.csv'
+        csv_exists = os.path.exists(csv_path)
+        csv_size = os.path.getsize(csv_path) if csv_exists else 0
+        
+        # Try to read first few lines of CSV
+        csv_preview = []
+        csv_columns = []
+        csv_error = None
+        
+        if csv_exists:
+            try:
+                # Read just first 3 rows for preview
+                df_preview = pd.read_csv(csv_path, nrows=3)
+                csv_columns = list(df_preview.columns)
+                csv_preview = df_preview.to_dict('records')
+                
+                # Also get total row count
+                df_full = pd.read_csv(csv_path)
+                total_rows = len(df_full)
+            except Exception as e:
+                csv_error = str(e)
+                total_rows = 0
+        else:
+            total_rows = 0
+        
+        # Check database connection
+        db_error = None
+        book_count = 0
+        try:
+            db = get_db()
+            cursor = db.cursor()
+            cursor.execute("SELECT COUNT(*) FROM books")
+            book_count = cursor.fetchone()[0]
+        except Exception as e:
+            db_error = str(e)
+        
+        return jsonify({
+            "current_working_directory": cwd,
+            "data_directory_exists": data_dir_exists,
+            "data_directory_contents": data_dir_contents,
+            "csv_file_exists": csv_exists,
+            "csv_file_size_bytes": csv_size,
+            "csv_total_rows": total_rows,
+            "csv_columns": csv_columns,
+            "csv_preview": csv_preview,
+            "csv_error": csv_error,
+            "database_connection_error": db_error,
+            "books_in_database": book_count
+        })
+        
+    except Exception as e:
+        return jsonify({"error": f"Debug failed: {str(e)}"}), 500
+
+@app.route("/books/test-modify", methods=["POST"])
+def test_modify_books():
+    """Test endpoint to manually modify a few books for testing"""
+    try:
+        db = get_db()
+        cursor = db.cursor()
+        
+        # Get 3 random books
+        cursor.execute("SELECT id, title, price FROM books ORDER BY RANDOM() LIMIT 3")
+        books = cursor.fetchall()
+        
+        if not books:
+            return jsonify({"error": "No books found in database"}), 404
+        
+        modified_books = []
+        for book_id, title, current_price in books:
+            # Modify price slightly
+            new_price = round(current_price * 1.1, 2)  # 10% increase
+            
+            # Update with current timestamp
+            cursor.execute("""
+                UPDATE books 
+                SET price = ?, last_updated = CURRENT_TIMESTAMP 
+                WHERE id = ?
+            """, (new_price, book_id))
+            
+            modified_books.append({
+                "id": book_id,
+                "title": title,
+                "old_price": current_price,
+                "new_price": new_price
+            })
+        
+        db.commit()
+        
+        return jsonify({
+            "message": f"Successfully modified {len(modified_books)} books for testing",
+            "modified_books": modified_books,
+            "timestamp": datetime.now().isoformat()
+        })
+        
+    except Exception as e:
+        logger.error(f"Error in test modify: {e}")
+        return jsonify({"error": str(e)}), 500
 
 # App teardown
 @app.teardown_appcontext
